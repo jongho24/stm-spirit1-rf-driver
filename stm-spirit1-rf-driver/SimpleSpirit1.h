@@ -35,11 +35,16 @@
 #define OFF    1
 
 
+/*** Macros for Spirit1 API ***/
+/* max payload */
+#define SPIRIT1_MAX_PAYLOAD     (MAX_PACKET_LEN)
+
+
 /*** Missing Cube External Declarations ***/
 extern "C" void SpiritManagementSetFrequencyBase(uint32_t);
 
 
-/*** UnlockedSPI for Performance (due to singleton) ***/
+/*** UnlockedSPI for Usage in IRQ context ***/
 class UnlockedSPI : public SPI {
 public:
     UnlockedSPI(PinName mosi, PinName miso, PinName sclk) :
@@ -53,6 +58,44 @@ public:
 /*** A Simple Spirit1 Class ***/
 // NOTE: must be a singleton (due to mix of MBED/CUBE code)!!!
 // NOTE: implementation is IRQ-save but (intentionally) NOT thread-safe!!!
+/** Simple Spirit1 Class
+ *
+ * @Note Synchronization level: implementation is IRQ-save but (intentionally) NOT thread-safe!!!
+ *
+ * Example:
+ * @code
+ * #include "mbed.h"
+ * #include "SimpleSpirit1.h"
+ *
+ * static char send_buf[] = "Hello World!";
+ *
+ * static SimpleSpirit1 &myspirit = SimpleSpirit1::CreateInstance(D11, D12, D3, D9, D10, D2);
+ *
+ * static volatile bool tx_done_flag = false;
+ *
+ * static void callback_func(int event)
+ * {
+ *   if (event == SimpleSpirit1::TX_DONE) {
+ *     tx_done_flag = true;
+ *   }
+ * }
+ *
+ * int main()
+ * {
+ *   myspirit.attach_irq_callback(callback_func);
+ *   myspirit.on();
+ *
+ *   while(1)
+ *   {
+ *     size_t curr_len = strlen((const char*)send_buf);
+ *     myspirit.send(send_buf, curr_len);
+ *
+ *     while(!tx_done_flag);
+ *     tx_done_flag = false;
+ *   }
+ * }
+ * @endcode
+ */
 class SimpleSpirit1 {
  protected:
 	static SimpleSpirit1 *_singleton;
@@ -80,7 +123,7 @@ class SimpleSpirit1 {
     	set_ready_state();
 	    cmd_strobe(SPIRIT1_STROBE_RX);
 #ifdef DEBUG_IRQ
-	    debug("\n\r%s (%d)\n\r", __func__, __LINE__);
+	    debug("\r\n%s (%d)\r\n", __func__, __LINE__);
 #endif
     }
 
@@ -119,13 +162,13 @@ class SimpleSpirit1 {
     	_irq.disable_irq();
     	_nr_of_irq_disables++;
 #ifndef NDEBUG
-    	debug_if(_nr_of_irq_disables == 0, "\n\rassert failed in: %s (%d)\n\r", __func__, __LINE__);
+    	debug_if(_nr_of_irq_disables == 0, "\r\nassert failed in: %s (%d)\r\n", __func__, __LINE__);
 #endif
     }
 
     void enable_spirit_irq(void) {
 #ifndef NDEBUG
-    	debug_if(_nr_of_irq_disables == 0, "\n\rassert failed in: %s (%d)\n\r", __func__, __LINE__);
+    	debug_if(_nr_of_irq_disables == 0, "\r\nassert failed in: %s (%d)\r\n", __func__, __LINE__);
 #endif
     	if(--_nr_of_irq_disables == 0)
     		_irq.enable_irq();
@@ -373,6 +416,17 @@ public:
 		TX_ERR
     };
 
+    /** Create singleton instance of 'SimpleSpirit1'
+     *
+     * @param mosi 'PinName' of mosi pin to use
+     * @param miso 'PinName' of miso pin to use
+     * @param sclk 'PinName' of clock pin to use
+     * @param irq  'PinName' of interrupt pin to use
+     * @param cs   'PinName' of chip-select pin pin to use
+     * @param sdn  'PinName' of pin to use for device shutdown
+     *
+     * @returns     reference to singleton instance
+     */
     static SimpleSpirit1& CreateInstance(PinName mosi, PinName miso, PinName sclk,
     		PinName irq, PinName cs, PinName sdn,
 			PinName led = NC) {
@@ -388,6 +442,10 @@ public:
     	return *_singleton;
     }
 
+    /** Get singleton instance of 'SimpleSpirit1'
+     *
+     * @returns     reference to singleton instance
+     */
     static SimpleSpirit1& Instance() {
     	if(_singleton == NULL) {
     		error("SimpleSpirit1 must be created before used!\n");
@@ -396,52 +454,80 @@ public:
     	return *_singleton;
     }
 
-    /** Attach a function to be called by the Spirit Irq handler when packet has arrived
+    /** Attach a function to be called by the Spirit Irq handler when an event has occurred
      *
-     *  @param func A void() callback, or 0 to set as none
+     *  @param func A void(int) callback, or 0 to set as none
      *
      *  @note  Function 'func' will be executed in interrupt context!
+     *  @note  Function 'func' will be call with either 'RX_DONE', 'TX_DONE', or 'TX_ERR' as parameter
+     *         to indicate which event has occurred.
      */
     void attach_irq_callback(Callback<void(int)> func) {
     	_current_irq_callback = func;
     }
 
-    /** Switch Radio On/Off **/
+    /** Switch Radio On
+     */
     int on(void);
+
+    /** Switch Radio Off
+     */
     int off(void);
 
-    /** Set Channel **/
+    /** Set Channel
+     */
     void set_channel(uint8_t channel) {
     	SpiritRadioSetChannel(channel);
     }
 
-    /** Send a Buffer **/
-    int send(const void *payload, unsigned int payload_len);
+    /** Send a Buffer
+     *
+     * @param payload       pointer to buffer to be send
+     * @param payload_len   length of payload buffer in bytes
+     * @param use_csma_ca   should CSMA/CA be enabled for transmission
+     *
+     * @returns             zero in case of success, non-zero error code otherwise
+     *
+     * @note                the maximum payload size in bytes allowed is defined by macro 'SPIRIT1_MAX_PAYLOAD'
+     */
+    int send(const void *payload, unsigned int payload_len, bool use_csma_ca = true);
 
-    /** Read into Buffer **/
+    /** Copy received data into buffer
+     *
+     * @param buf       pointer to buffer to be filled
+     * @param bufsize   size of buffer
+     *
+     * @returns         number of bytes copied into the buffer
+     *
+     * @note            the buffer should be (at least) of size 'SPIRIT1_MAX_PAYLOAD' (in bytes).
+     */
     int read(void *buf, unsigned int bufsize);
 
-    /** Perform a Clear-Channel Assessment (CCA) to find out if there is
-        a packet in the air or not.
-        Returns 1 if packet has been seen.
-      */
+    /** Perform a Clear-Channel Assessment (CCA) to find out whether the medium is idle or not.
+     *
+     * @returns  1 if the medium is busy.
+     */
     int channel_clear(void);
 
-    /** Check if the radio driver has just received a packet **/
+    /** Check if the radio driver has just received a packet
+     */
     int get_pending_packet(void);
 
-    /** Is radio currently receiving **/
+    /** Is radio currently receiving
+     */
     bool is_receiving(void) {
     	return _is_receiving;
     }
 
-    /** Get latest value of RSSI (in dBm) **/
+    /** Get latest value of RSSI (in dBm)
+     */
     float get_last_rssi_dbm(void) {
     	get_last_rssi_raw();
 		return (-120.0+((float)(last_rssi-20))/2);
     }
 
-    /** Get latest value of RSSI (as Spirit1 raw value) **/
+    /** Get latest value of RSSI (as Spirit1 raw value)
+     */
     uint8_t get_last_rssi_raw(void) {
     	if(last_rssi == 0) {
     		last_rssi = qi_get_rssi();
@@ -449,7 +535,8 @@ public:
     	return last_rssi;
     }
 
-    /** Get latest value of LQI (scaled to 8-bit) **/
+    /** Get latest value of LQI (scaled to 8-bit)
+     */
     uint8_t get_last_sqi(void) {
     	const uint8_t max_sqi = 8 * ((SYNC_LENGTH>>1)+1);
     	if(last_sqi == 0) {
@@ -460,7 +547,8 @@ public:
     	return (last_sqi * 255 / max_sqi);
     }
 
-    /** Reset Board **/
+    /** Reset Board
+     */
     void reset_board() {
     	init();
     }
